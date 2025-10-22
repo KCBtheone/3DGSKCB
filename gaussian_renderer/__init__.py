@@ -15,21 +15,34 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
     """
  
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    # 如果场景中没有高斯点，返回一个空背景以避免崩溃
+    if pc.get_xyz.shape[0] == 0:
+        h, w = int(viewpoint_camera.image_height), int(viewpoint_camera.image_width)
+        empty_render = bg_color.repeat(h, w, 1).permute(2, 0, 1)
+        return {
+            "render": empty_render,
+            "viewspace_points": torch.empty(0, 3, device="cuda"),
+            "visibility_filter": torch.empty(0, dtype=torch.bool, device="cuda"),
+            "radii": torch.empty(0, device="cuda"),
+            "depth": torch.zeros((1, h, w), device="cuda"),
+        }
+
+    # [核心对齐] 创建一个与3D高斯点一一对应的2D点张量，
+    # 这是官方实现中将梯度从2D视图空间传回3D高斯位置的关键。
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
     except:
         pass
 
-    # Set up rasterization configuration
+    # 设置光栅化器
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
@@ -46,83 +59,50 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug,
-        antialiasing=pipe.antialiasing
+        antialiasing=pipe.antialiasing # 使用来自pipeline参数的设置
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
+    # 准备高斯属性
     means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
-
-    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
-    # scaling / rotation by the rasterizer.
-    scales = None
-    rotations = None
-    cov3D_precomp = None
-
-    if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
-    else:
-        scales = pc.get_scaling
-        rotations = pc.get_rotation
-
-    # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
-    # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
-    shs = None
-    colors_precomp = None
-    if override_color is None:
-        if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
-            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
-            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
-        else:
-            if separate_sh:
-                dc, shs = pc.get_features_dc, pc.get_features_rest
-            else:
-                shs = pc.get_features
-    else:
-        colors_precomp = override_color
-
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    if separate_sh:
-        rendered_image, radii, depth_image = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
-            dc = dc,
-            shs = shs,
-            colors_precomp = colors_precomp,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
-    else:
-        rendered_image, radii, depth_image = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
-            shs = shs,
-            colors_precomp = colors_precomp,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
-        
-    # Apply exposure to rendered image (training only)
-    if use_trained_exp:
-        exposure = pc.get_exposure_from_name(viewpoint_camera.image_name)
-        rendered_image = torch.matmul(rendered_image.permute(1, 2, 0), exposure[:3, :3]).permute(2, 0, 1) + exposure[:3, 3,   None, None]
-
-    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
-    # They will be excluded from value updates used in the splitting criteria.
-    rendered_image = rendered_image.clamp(0, 1)
-    out = {
-        "render": rendered_image,
-        "viewspace_points": screenspace_points,
-        "visibility_filter" : (radii > 0).nonzero(),
-        "radii": radii,
-        "depth" : depth_image
-        }
+    scales = pc.get_scaling
+    rotations = pc.get_rotation
     
-    return out
+    # 准备颜色/球谐系统
+    if override_color is None:
+        shs = pc.get_features
+        colors_precomp = None
+    else:
+        # 如果提供了覆盖颜色(例如，用于渲染法线图)，则不使用球谐系数
+        shs = None
+        colors_precomp = override_color.float()
+
+    # 核心光栅化
+    rendered_image, radii, rendered_depth = rasterizer(
+        means3D = means3D,
+        means2D = means2D,
+        shs = shs,
+        colors_precomp = colors_precomp,
+        opacities = opacity,
+        scales = scales,
+        rotations = rotations,
+        cov3D_precomp = None
+    )
+    
+    # 整理输出
+    rendered_image = rendered_image.clamp(0, 1)
+    
+    # 确定哪些高斯点在视锥体内且半径大于0（即对最终图像有贡献）
+    visibility_filter = radii > 0
+    
+    # 返回一个字典，包含渲染结果和用于训练（特别是致密化）所需的信息
+    return {
+        "render": rendered_image,
+        "viewspace_points": screenspace_points, # [核心对齐] 返回梯度占位符本身
+        "visibility_filter": visibility_filter,
+        "radii": radii,
+        "depth": rendered_depth.unsqueeze(0),
+    }

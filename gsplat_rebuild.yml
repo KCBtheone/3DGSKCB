@@ -1,0 +1,42 @@
+name: gs
+channels:
+  - pytorch
+  - nvidia
+  - pytorch3d
+  - conda-forge
+
+dependencies:
+  # --- 核心框架与CUDA ---
+  - python=3.8
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.4  # 统一使用与 PyTorch 匹配的 CUDA 版本
+
+  # --- AI/ML 核心库 ---
+  - transformers
+  - datasets
+  - accelerate
+  - safetensors
+
+  # --- 3D/视觉/科学计算 ---
+  - pytorch3d
+  - open3d
+  - opencv
+  - scikit-image
+  - scikit-learn
+  - pandas
+  - matplotlib
+  - seaborn
+  - ffmpeg
+
+  # --- 常用工具 ---
+  - tqdm
+  - pyyaml
+  - plyfile
+  - pillow
+  - imageio
+  - fvcore
+  - iopath
+  - ConfigArgParse
+  - jupyterlab # 包含 ipywidgets, ipykernel 等

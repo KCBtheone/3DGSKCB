@@ -22,9 +22,9 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
-        """b
-        :param path: Path to colmap scene main folder.
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True):
+        """
+        Loads a scene from the input data.
         """
         self.model_path = args.model_path
         self.loaded_iter = None
@@ -40,61 +40,66 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
+        # 自动识别场景类型 (Colmap vs Blender/NeRF)
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
-            print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)
+            print("Found transforms_train.json file, assuming Blender (NeRF) data set!")
+            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
         else:
-            assert False, "Could not recognize scene type!"
+            raise Exception("Could not recognize scene type!")
 
         if not self.loaded_iter:
-            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
-                dest_file.write(src_file.read())
-            json_cams = []
-            camlist = []
-            if scene_info.test_cameras:
-                camlist.extend(scene_info.test_cameras)
-            if scene_info.train_cameras:
-                camlist.extend(scene_info.train_cameras)
-            for id, cam in enumerate(camlist):
-                json_cams.append(camera_to_JSON(id, cam))
-            with open(os.path.join(self.model_path, "cameras.json"), 'w') as file:
-                json.dump(json_cams, file)
+            # For camera visualization
+            with open(os.path.join(args.model_path, "cameras.json"), 'w') as file:
+                json.dump([], file)
 
         if shuffle:
-            random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
-            random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
+            random.shuffle(scene_info.train_cameras)
+            random.shuffle(scene_info.test_cameras)
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
-        for resolution_scale in resolution_scales:
-            print("Loading Training Cameras")
-            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False)
-            print("Loading Test Cameras")
-            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
+        # 从 CameraInfo 列表创建完整的 Camera 对象
+        print("Loading Training Cameras")
+        self.train_cameras = cameraList_from_camInfos(scene_info.train_cameras, args.resolution, args)
+        print("Loading Test Cameras")
+        self.test_cameras = cameraList_from_camInfos(scene_info.test_cameras, args.resolution, args)
 
+        # 根据情况加载或创建高斯点云
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
-                                                           "point_cloud",
-                                                           "iteration_" + str(self.loaded_iter),
-                                                           "point_cloud.ply"), args.train_test_exp)
+                                                 "point_cloud",
+                                                 "iteration_" + str(self.loaded_iter),
+                                                 "point_cloud.ply"))
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
+            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+        
+        # 保存相机参数供查看器使用
+        if not self.loaded_iter:
+            json_cams = []
+            for cam in self.train_cameras:
+                json_cams.append(camera_to_JSON(cam.uid, cam))
+            for cam in self.test_cameras:
+                json_cams.append(camera_to_JSON(cam.uid, cam))
+            with open(os.path.join(self.model_path, "cameras.json"), 'w') as file:
+                json.dump(json_cams, file)
 
-    def save(self, iteration):
-        point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
+    # ‼️‼️ [核心修改] ‼️‼️
+    # 添加 is_best 参数以支持保存最佳模型
+    def save(self, iteration, is_best=False):
+        """保存当前的高斯模型到.ply文件"""
+        if is_best:
+            point_cloud_path = os.path.join(self.model_path, "point_cloud", "best")
+        else:
+            point_cloud_path = os.path.join(self.model_path, "point_cloud", f"iteration_{iteration}")
+        
+        print(f"Saving Gaussian model to {point_cloud_path}")
+        os.makedirs(point_cloud_path, exist_ok=True)
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
-        exposure_dict = {
-            image_name: self.gaussians.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
-            for image_name in self.gaussians.exposure_mapping
-        }
 
-        with open(os.path.join(self.model_path, "exposure.json"), "w") as f:
-            json.dump(exposure_dict, f, indent=2)
+    def getTrainCameras(self):
+        return self.train_cameras
 
-    def getTrainCameras(self, scale=1.0):
-        return self.train_cameras[scale]
-
-    def getTestCameras(self, scale=1.0):
-        return self.test_cameras[scale]
+    def getTestCameras(self):
+        return self.test_cameras

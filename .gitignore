@@ -1,8 +1,38 @@
+# --- 1. 默认规则：忽略所有文件夹 ---
+# 这一行是核心：默认情况下，忽略所有文件夹。
+# 注意：它不会忽略根目录下的文件 (如 train.py)。
+*/
+
+# --- 2. 白名单：取消忽略 3DGS 官方的核心代码文件夹 ---
+# (这些是您要保存的)
+# 使用 ! 来 "取消忽略"
+!arguments/
+!assets/
+!colmap_loader/
+!gaussian_renderer/
+!scene/
+!submodules/
+!utils/
+
+# --- 3. 黑名单：全局忽略 (即使在白名单文件夹里) ---
+# 忽略 Python 缓存和环境 (您提到的"环境也不用保存")
+__pycache__/
 *.pyc
-.vscode
-output
-build
-diff_rasterization/diff_rast.egg-info
-diff_rasterization/dist
-tensorboard_3d
-screenshots
+.venv/
+venv/
+env/
+
+# 忽略 3DGS 的输出和数据 (防止您在根目录创建它们)
+output/
+data/
+dataset/
+*.ply
+*.splat
+*.log
+logs/
+
+# 忽略 IDE 和系统文件
+.vscode/
+.idea/
+.DS_Store
+*.ipynb_checkpoints

@@ -1,0 +1,30 @@
+name: sugar-env
+channels:
+  - pytorch3d
+  - pytorch
+  - nvidia
+  - conda-forge  # 将 conda-forge 作为通用包的来源
+  - plotly
+  - iopath
+
+dependencies:
+  # --- 核心框架与CUDA ---
+  - python=3.9
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1  # 关键：与您的系统驱动CUDA 12.1完全匹配
+
+  # --- 关键3D与科学计算库 ---
+  - pytorch3d
+  - plotly
+  - iopath
+  - ffmpeg
+
+  # --- 常用工具库 ---
+  - tqdm
+  - pyyaml
+  - plyfile
+  - yacs
+  - ipykernel
+  - ipywidgets

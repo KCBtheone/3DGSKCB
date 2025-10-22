@@ -373,8 +373,15 @@ def read_points3D_text(path):
                 xyz = np.array(tuple(map(float, elems[1:4])))
                 rgb = np.array(tuple(map(int, elems[4:7])))
                 error = float(elems[7])
-                image_ids = np.array(tuple(map(int, elems[8::2])))
-                point2D_idxs = np.array(tuple(map(int, elems[9::2])))
+                # image_ids = np.array(tuple(map(int, elems[8::2])))
+                # point2D_idxs = np.array(tuple(map(int, elems[9::2])))
+                if len(elems) > 8:
+                    image_ids = np.array(tuple(map(int, elems[8::2])))
+                    point2D_idxs = np.array(tuple(map(int, elems[9::2])))
+                else:
+                    # 如果没有跟踪信息，则传递空数组
+                    image_ids = np.array([], dtype=np.int32)
+                    point2D_idxs = np.array([], dtype=np.int32)
                 points3D[point3D_id] = Point3D(
                     id=point3D_id,
                     xyz=xyz,
