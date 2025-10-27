@@ -1,13 +1,11 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
+"""
+Copyright (C) 2023, Inria
+GRAPHDECO research group, https://team.inria.fr/graphdeco
+All rights reserved.
+This software is free for non-commercial, research and evaluation use
+under the terms of the LICENSE.md file.
+For inquiries contact  george.drettakis@inria.fr
+"""
 
 import os
 import random
@@ -40,12 +38,16 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        # 自动识别场景类型 (Colmap vs Blender/NeRF)
+        # 自动识别场景类型 (Colmap vs Blender/NeRF vs TNT)
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender (NeRF) data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
+        # [TNT数据集加载逻辑]
+        elif os.path.exists(os.path.join(args.source_path, "train_list.txt")):
+            print("Found train_list.txt file, assuming TNT data set!")
+            scene_info = sceneLoadTypeCallbacks["TNT"](args.source_path, args.eval)
         else:
             raise Exception("Could not recognize scene type!")
 
@@ -85,7 +87,7 @@ class Scene:
             with open(os.path.join(self.model_path, "cameras.json"), 'w') as file:
                 json.dump(json_cams, file)
 
-    # ‼️‼️ [核心修改] ‼️‼️
+
     # 添加 is_best 参数以支持保存最佳模型
     def save(self, iteration, is_best=False):
         """保存当前的高斯模型到.ply文件"""

@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved#
+# All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
@@ -84,6 +84,7 @@ class GaussianModel:
 
     @property
     def get_isotropy(self):
+        """计算各向同性度指数 I = s_min / s_max。返回形状为 [N, 1] 的张量。"""
         scales = self.get_scaling
         s_max, _ = torch.max(scales, dim=1)
         s_min, _ = torch.min(scales, dim=1)
@@ -91,6 +92,7 @@ class GaussianModel:
 
     @property
     def get_normals(self):
+        """计算法线向量，与最小尺度对应的轴对齐。"""
         scales = self.get_scaling
         smallest_scale_indices = torch.argmin(scales, dim=1)
         normals_local = F.one_hot(smallest_scale_indices, num_classes=3).float()
@@ -98,15 +100,29 @@ class GaussianModel:
         normals_world = torch.bmm(rotations, normals_local.unsqueeze(-1)).squeeze(-1)
         return F.normalize(normals_world, p=2, dim=1)
 
-    def get_covariance(self, scaling_modifier=1):
-        return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
+    def get_anisotropy_mask(self, threshold: float = 2.0):
+        """
 
-    # =================================================================================
-    # >>> [ 🚀 最终修正区: 采用更保守的批次大小 ] <<<
-    # =================================================================================
+        返回一个布尔掩码，标记那些足够扁平（各向异性）的高斯点。
+        只有这些点的法线方向被认为是可靠的。
+        
+        参数:
+            threshold (float): 长轴与短轴的最小比例阈值。
+        返回:
+            torch.Tensor: 一个布尔张量，shape为 [N]，True代表满足条件。
+        """
+        scales = self.get_scaling
+        s_max, _ = torch.max(scales, dim=1)
+        s_min, _ = torch.min(scales, dim=1)
+        is_anisotropic = (s_max / (s_min + 1e-8)) > threshold
+        return is_anisotropic
 
-    def compute_smoothness_loss(self, k_nearest: int = 5, batch_size: int = 2048):
-        """[策略 #2] [最终修正] 计算法线平滑度损失，使用更小的批次以避免OOM。"""
+    def compute_smoothness_loss(self, k_nearest: int = 5, batch_size: int = 1024):
+        """
+
+        计算法线平滑度损失。通过惩罚相邻高斯点法线方向的剧烈变化来促进表面的平滑。
+        使用分批处理以避免在点数过多时发生OOM。
+        """
         xyz = self.get_xyz
         normals = self.get_normals
         num_points = xyz.shape[0]
@@ -119,55 +135,41 @@ class GaussianModel:
 
         with torch.no_grad():
             for i in range(0, num_points, batch_size):
-                end = i + batch_size
+                end = min(i + batch_size, num_points)
                 batch_xyz = xyz[i:end]
+
                 dist_sq_batch = torch.cdist(batch_xyz, xyz, p=2)**2
+
                 dist_k_sq, topk_indices = torch.topk(dist_sq_batch, k=k_nearest + 1, dim=1, largest=False, sorted=True)
+
                 knn_indices_list.append(topk_indices[:, 1:])
+
                 neighbor_dist = torch.sqrt(dist_k_sq[:, 1:])
                 weights = (1.0 / (neighbor_dist + 1e-8))
-                weights = F.normalize(weights, p=1, dim=1)
+                weights = F.normalize(weights, p=1, dim=1) 
                 weights_list.append(weights)
 
         knn_indices = torch.cat(knn_indices_list, dim=0)
         weights = torch.cat(weights_list, dim=0)
         
+
         source_normals = normals.unsqueeze(1).expand(-1, k_nearest, -1)
         neighbor_normals = normals[knn_indices]
         
+
         diff_normals_sq = torch.sum((source_normals - neighbor_normals)**2, dim=-1)
         smoothness_loss = torch.mean(torch.sum(weights * diff_normals_sq, dim=1))
-        return smoothness_loss
-
-    def geometric_inconsistency_check(self, k_nearest: int, inconsistency_threshold: float, batch_size: int = 2048):
-        """[策略 #3] [最终修正] 检查几何不一致性，使用更小的批次。"""
-        xyz = self.get_xyz
-        normals = self.get_normals
-        num_points = xyz.shape[0]
-
-        if num_points <= k_nearest:
-            return torch.zeros(num_points, dtype=torch.bool, device=xyz.device)
         
-        avg_cos_sim_list = []
-        with torch.no_grad():
-            for i in range(0, num_points, batch_size):
-                end = i + batch_size
-                batch_xyz = xyz[i:end]
-                batch_normals = normals[i:end]
-                dist_sq_batch = torch.cdist(batch_xyz, xyz, p=2)**2
-                _, topk_indices = torch.topk(dist_sq_batch, k=k_nearest + 1, dim=1, largest=False)
-                knn_indices = topk_indices[:, 1:]
-                source_normals = batch_normals.unsqueeze(1).expand(-1, k_nearest, -1)
-                neighbor_normals = normals[knn_indices]
-                cos_sim = F.cosine_similarity(source_normals, neighbor_normals, dim=-1)
-                avg_cos_sim_list.append(torch.mean(cos_sim, dim=1))
+        return smoothness_loss
+    # =================================================================================
 
-        avg_cos_sim = torch.cat(avg_cos_sim_list, dim=0)
-        return avg_cos_sim < inconsistency_threshold
+    def get_covariance(self, scaling_modifier=1):
+        return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
-    # (保留原有方法)
     def oneupSHdegree(self):
-        if self.active_sh_degree < self.max_sh_degree: self.active_sh_degree += 1
+        if self.active_sh_degree < self.max_sh_degree:
+            self.active_sh_degree += 1
+
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
@@ -175,12 +177,16 @@ class GaussianModel:
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
+
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+
         dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 1e-7)
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
+
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
@@ -193,6 +199,7 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -201,6 +208,7 @@ class GaussianModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
+
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init * self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final * self.spatial_lr_scale,
@@ -213,6 +221,7 @@ class GaussianModel:
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
                 return lr
+
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
         for i in range(self._features_dc.shape[1]*self._features_dc.shape[2]): l.append(f'f_dc_{i}')
@@ -221,6 +230,7 @@ class GaussianModel:
         for i in range(self._scaling.shape[1]): l.append(f'scale_{i}')
         for i in range(self._rotation.shape[1]): l.append(f'rot_{i}')
         return l
+
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
         xyz = self._xyz.detach().cpu().numpy()
@@ -236,10 +246,12 @@ class GaussianModel:
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
+
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
+
     def load_ply(self, path):
         plydata = PlyData.read(path)
         xyz = np.stack((plydata.elements[0]["x"], plydata.elements[0]["y"], plydata.elements[0]["z"]), axis=1)
@@ -272,6 +284,7 @@ class GaussianModel:
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
         self.active_sh_degree = self.max_sh_degree
+
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -284,6 +297,7 @@ class GaussianModel:
                 self.optimizer.state[group['params'][0]] = stored_state
                 optimizable_tensors[name] = group["params"][0]
         return optimizable_tensors
+
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -298,6 +312,7 @@ class GaussianModel:
             else:
                 group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
         return optimizable_tensors
+
     def prune_points(self, mask):
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
@@ -310,6 +325,7 @@ class GaussianModel:
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -326,6 +342,7 @@ class GaussianModel:
             else:
                 group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
         return optimizable_tensors
+
     def densification_postfix(self, tensors_dict):
         optimizable_tensors = self.cat_tensors_to_optimizer(tensors_dict)
         self._xyz = optimizable_tensors["xyz"]
@@ -337,54 +354,49 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
     def add_densification_stats(self, screenspace_points_grad, visibility_filter):
         self.xyz_gradient_accum[visibility_filter] += torch.norm(screenspace_points_grad[visibility_filter,:2], dim=-1, keepdim=True)
         self.denom[visibility_filter] += 1
 
     def densify_and_prune(self, opt, iteration, scene_extent, max_screen_size):
+        """
+        [稳定版]
+        这是更接近官方实现的致密化与剪枝逻辑。
+        它不包含复杂的几何感知逻辑，因此更稳定且不容易导致显存爆炸。
+        """
         grads = self.xyz_gradient_accum / (self.denom + 1e-7)
         grads[grads.isnan()] = 0.0
 
-        use_geo_densify = (opt.use_geometric_densify and iteration >= opt.geo_densify_start_iter)
-        geo_inconsistency_mask = None
-        if use_geo_densify:
-            geo_inconsistency_mask = self.geometric_inconsistency_check(
-                k_nearest=10, 
-                inconsistency_threshold=opt.geo_inconsistency_threshold
-            )
-            large_gaussian_threshold = opt.geo_densify_relative_size_threshold * scene_extent
-            large_gaussians_mask = self.get_scaling.max(dim=1).values > large_gaussian_threshold
-            grads[large_gaussians_mask & geo_inconsistency_mask] = opt.densify_grad_threshold * 1.5
+        if iteration < opt.densify_until_iter:
+            self.densify_and_clone(grads, opt.densify_grad_threshold, scene_extent)
+            self.densify_and_split(grads, opt.densify_grad_threshold, scene_extent)
 
-        self.densify_and_clone(grads, opt.densify_grad_threshold, scene_extent)
-        self.densify_and_split(grads, opt.densify_grad_threshold, scene_extent)
-
-        prune_mask_opacity = (self.get_opacity < opt.min_opacity).squeeze()
-        
+        prune_mask = (self.get_opacity < opt.min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
-            prune_mask_opacity = torch.logical_or(prune_mask_opacity, big_points_vs)
-
-        if use_geo_densify:
-            prune_mask_geo = geo_inconsistency_mask & (self.get_opacity < 0.1).squeeze()
-            prune_mask_opacity = torch.logical_or(prune_mask_opacity, prune_mask_geo)
-
-        self.prune_points(prune_mask_opacity)
+            prune_mask = torch.logical_or(prune_mask, big_points_vs)
+        
+        self.prune_points(prune_mask)
         torch.cuda.empty_cache()
 
     def densify_and_clone(self, grads, grad_threshold, extent):
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense * extent)
+        
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+
         d = {"xyz": new_xyz, "f_dc": new_features_dc, "f_rest": new_features_rest, "opacity": new_opacities,
              "scaling": new_scaling, "rotation": new_rotation}
+        
         self.densification_postfix(d)
+
     def densify_and_split(self, grads, grad_threshold, extent, N=2):
         n_init_points = self.get_xyz.shape[0]
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -392,18 +404,24 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense * extent)
+        
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+        
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+
         d = {"xyz": new_xyz, "f_dc": new_features_dc, "f_rest": new_features_rest, "opacity": new_opacity,
              "scaling": new_scaling, "rotation": new_rotation}
+
         self.densification_postfix(d)
+
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)

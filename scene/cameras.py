@@ -16,7 +16,6 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
 class Camera(nn.Module):
     # ==============================================================================
-    # ‼️ [核心修改] ‼️
     # 在构造函数签名中加入所有可能的几何先验图，特别是新增的 gt_curvature_map
     # ==============================================================================
     def __init__(self, colmap_id, R, T, FoVx, FoVy,
@@ -46,10 +45,10 @@ class Camera(nn.Module):
             # 应用 alpha mask (如果提供)
             self.original_image *= gt_alpha_mask.to(self.data_device)
 
-        # [核心修改] 统一存储所有几何先验，并优雅处理缺失情况
+        # 统一存储所有几何先验，并优雅处理缺失情况
         self.gt_normal_map = gt_normal_map.to(self.data_device) if gt_normal_map is not None else None
         self.gt_confidence_map = gt_confidence_map.to(self.data_device) if gt_confidence_map is not None else None
-        self.gt_curvature_map = gt_curvature_map.to(self.data_device) if gt_curvature_map is not None else None # <--- 新增存储逻辑
+        self.gt_curvature_map = gt_curvature_map.to(self.data_device) if gt_curvature_map is not None else None 
         
         self.zfar = 100.0
         self.znear = 0.01

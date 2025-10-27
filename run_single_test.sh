@@ -1,153 +1,200 @@
 #!/bin/bash
-# set -x # 如果还需要调试，可以取消此行的注释
+# set -x # 如果需要调试，可以取消此行的注释
 
 # ===================================================================================
-#      Bonsai场景几何增强策略扫描脚本 (v1.2 - 20k迭代优化版)
+#      V6 核心模组对决实验 v1.2 (最终扩展版)
 #
-# 1. 场景固定为 "bonsai"。
-# 2. [核心] 总迭代次数优化为 20000 次，用于快速验证。
-# 3. [核心] 几何约束起始点按比例提前至 6000 次。
-# 4. 系统性地测试策略 #2 (平滑度损失) 和策略 #3 (几何致密化) 的效果。
+# 实验设计:
+# - 基线: 强大的 v5_error_dynamics (Ours-Base)。
+# - 消融: 在 Ours-Base 上，独立测试 DINO, SVAS, DEID, OAI 四个模组的贡献。
+# - 协同: 测试关键模组的组合效果，冲击SOTA。
+# - 探索: 测试所有模组的极限性能，并与一个先进的替代方案 (Physical Alpha) 对比。
 # ===================================================================================
 
-# --- [ 1. 终止信号陷阱 ] ---
+# --- [ 1. 全局配置与辅助函数 ] ---
 trap 'cleanup_and_exit' SIGINT SIGTERM
 cleanup_and_exit() {
     echo "" && echo "###  检测到 Ctrl+C！正在强制终止所有子进程...  ###" && kill -9 -$$
 }
 
-# --- [ 2. 全局配置区 ] ---
-PROJECT_DIR="/root/autodl-tmp/gaussian-splatting"
-DATA_ROOT_DIR="$PROJECT_DIR/data/nerf_360"
-# 新的输出目录，以反映20k的迭代设置
-EXPERIMENTS_ROOT_DIR="$PROJECT_DIR/output/BONSAI_GEOMETRY_ENHANCED_SWEEP_20K"
+# --- 请根据您的环境修改以下路径 ---
+MY_PROJECT_DIR="/root/autodl-tmp/gaussian-splatting" # 你的代码库路径
+# ---------------------------------
 
-# --- [ 3. 场景列表 ] ---
+DATA_ROOT_DIR="$MY_PROJECT_DIR/data/nerf_360"
+# [!!] 使用一个全新的根目录来存放这次关键实验的结果
+EXPERIMENTS_ROOT_DIR="$MY_PROJECT_DIR/output/V6_MODULE_SHOWDOWN_FINAL"
+
 SCENE="bonsai"
+RESOLUTION=8
+ITERATIONS=30000
 
-# --- [ 4. 固定实验配置 ] ---
-ITERATIONS=20000
-# 在7k和最终迭代时保存和测试
-SAVE_AND_TEST_ITERS="7000 ${ITERATIONS}"
+# --- 实验核心配置 ---
+TEST_ITERS=$(seq 7000 1000 ${ITERATIONS})
+SAVE_ITERS=""
+CHECKPOINT_ITERS="${ITERATIONS}"
 
-# 按比例提前的几何约束起始迭代次数 (大约在总时长的 1/3 处)
-GEOMETRY_START_ITER=6000
-
-# =================================================================================
-#            [ 核心辅助函数：与您的脚本相同 ]
-# =================================================================================
-
-update_ranking_file() {
-    local model_path=$1; local exp_name=$2
-    local ranking_file=$(dirname "$model_path")/_ranking.txt; local log_file="${model_path}/console.log"
-    
-    if [ ! -f "$log_file" ] || [ -f "${model_path}/_FAILED.log" ]; then
-        echo "${exp_name} | FAILED" >> "$ranking_file"; return;
-    fi
-    
-    # 只取最终迭代 (20000) 的PSNR进行排名
-    local final_psnr=$(grep -E "^\[ITER ${ITERATIONS}\] Validation Results: L1" "$log_file" | awk '{print $NF}' | tail -1)
-    
-    if [[ "$final_psnr" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        printf "%-45s | %s\n" "${exp_name}" "${final_psnr}" >> "$ranking_file"
-        echo "        -> 📈 记录到排名文件: Final PSNR = ${final_psnr}"
-    else
-        printf "%-45s | %s\n" "${exp_name}" "PARSE_ERROR" >> "$ranking_file"
-        echo "        -> ⚠️ 无法从日志解析最终PSNR，已记录错误。"
-    fi
-}
-
-# --- [ 5. 主执行函数 ] ---
+# --- 辅助函数：运行单个实验 (保持不变) ---
 run_single_experiment() {
-    local scene_name=$1; local exp_name=$2; local model_path=$3; shift 3; local python_args=("$@")
+    local project_dir=$1; local scene_name=$2; local exp_name=$3; local model_path=$4; shift 4; local python_args=("$@")
     echo; echo "--- [场景: ${scene_name} | 实验: ${exp_name}] ---";
-    
-    if [ -d "${model_path}" ]; then echo "        -> 结果已存在，跳过。"; return; fi
-    
-    echo "        -> 输出至: ${model_path}"; mkdir -p "${model_path}"
-    export CUDA_LAUNCH_BLOCKING=1
-    
-    stdbuf -oL -eL python "${PROJECT_DIR}/train.py" "${python_args[@]}" | tee "${model_path}/console.log"
+    if [ -f "${model_path}/best.ply" ]; then
+        echo "        -> 结果 best.ply 已存在，跳过。"
+        return
+    elif [ -d "${model_path}" ]; then
+        echo "        -> 目录已存在但 best.ply 未找到，将重新运行..."
+        rm -rf "${model_path}"
+    fi
+    echo "        -> 使用代码库: ${project_dir}";
+    echo "        -> 输出至: ${model_path}";
+    mkdir -p "${model_path}";
+
+    stdbuf -oL -eL python "${project_dir}/train.py" "${python_args[@]}" | tee "${model_path}/console.log"
+
     local exit_code=${PIPESTATUS[0]}
-    
-    export CUDA_LAUNCH_BLOCKING=0
-    
-    if [ ${exit_code} -eq 0 ]; then
-        echo "        -> ✅ 成功完成。"; update_ranking_file "$model_path" "$exp_name";
+    if [ ${exit_code} -eq 0 ] && [ -f "${model_path}/best.ply" ]; then
+        echo "        -> ✅ 成功完成: ${exp_name}"
     else
-        echo "        -> ❌ 失败！(错误码 ${exit_code})。"; touch "${model_path}/_FAILED.log"; update_ranking_file "$model_path" "$exp_name";
+        echo "        -> ❌ 失败！(错误码 ${exit_code} 或 best.ply 未生成): ${exp_name}"
+        touch "${model_path}/_FAILED.log"
     fi
 }
 
-# --- [ 6. 实验调度 ] ---
-echo "🚀🚀🚀 开始运行 Bonsai 几何增强策略扫描 (20k 迭代优化版) 🚀🚀🚀"
-cd "$PROJECT_DIR" || exit
+# --- [ 2. 实验调度 ] ---
+echo "🚀🚀🚀 开始运行 V6 核心模组对决实验 (11组) 🚀🚀🚀"
 
-echo; echo "############################################################"
-echo "###    开始处理场景: [${SCENE}]"
-echo "############################################################"
-scene_path="$DATA_ROOT_DIR/$SCENE"; scene_output_root="$EXPERIMENTS_ROOT_DIR/$SCENE"
-resolution=4; image_subdir="images_4"
+IMAGES_SUBDIR="images_${RESOLUTION}"
+scene_path="$DATA_ROOT_DIR/$SCENE"
+scene_output_root="$EXPERIMENTS_ROOT_DIR/$SCENE"
+mkdir -p "$scene_output_root"
 
-ranking_file="${scene_output_root}/_ranking.txt"; 
-echo "# ${SCENE} 场景几何增强策略性能排行榜 (Final PSNR @ ${ITERATIONS} iters)" > "$ranking_file"
-echo "------------------------------------------------------------------" >> "$ranking_file"
+# --- 动态构建基础参数列表 ---
+base_args=(-s "$scene_path" --images "$IMAGES_SUBDIR" --iterations "$ITERATIONS" --resolution "$RESOLUTION" --eval)
+if [[ -n "$TEST_ITERS" ]]; then base_args+=(--test_iterations $TEST_ITERS); fi
+if [[ -n "$SAVE_ITERS" ]]; then base_args+=(--save_iterations $SAVE_ITERS); fi
+if [[ -n "$CHECKPOINT_ITERS" ]]; then base_args+=(--checkpoint_iterations $CHECKPOINT_ITERS); fi
 
-# --- 基础参数 (所有实验共享) ---
-# densify_until_iter 也需要相应缩短，官方默认是15k，对于20k的总迭代，我们可以设为12k-15k，这里取15k
-base_args=(-s "$scene_path" --images "$image_subdir" --iterations "$ITERATIONS" --resolution "$resolution" --eval \
-    --save_iterations $SAVE_AND_TEST_ITERS \
-    --test_iterations $SAVE_AND_TEST_ITERS \
-    --checkpoint_iterations $SAVE_AND_TEST_ITERS \
-    --densify_until_iter 15000
-)
+echo; echo "===================================================================="
+echo "                   开始处理场景: ${SCENE} (r=${RESOLUTION})"
+echo "===================================================================="
 
-# ========================= [ 实验组开始 ] =========================
+# ===================================================================================
+#                                 11 组对决实验
+# ===================================================================================
 
-# --- 实验 01: 基线 (Baseline) ---
-# 不使用任何新的几何增强策略，作为所有对比的基准。
-exp_name="exp01_baseline"; model_path="${scene_output_root}/${exp_name}";
-run_single_experiment "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path"
+# --- 实验 01: [你的起点] 我们强大的自适应基线 ---
+exp_name="exp01_ours_base"; model_path="${scene_output_root}/${exp_name}";
+run_single_experiment "$MY_PROJECT_DIR" "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path" \
+    --structural_loss_mode "ms_grad" \
+    --synergy_mode "v5_error_dynamics" \
+    --lambda_struct_loss 0.0 `# 禁用固定权重，因为是动态的` \
+    --lambda_struct_loss_base 0.1 \
+    --lambda_grad_loss_base 0.05 \
+    --error_dynamics_threshold 0.015
 
-# --- 实验 02-04: 单独测试策略 #2 (法线平滑度损失) ---
-# 在 6000 次迭代后引入
 
-# exp02: 平滑度损失 (弱)
-lambda=0.001; exp_name="exp02_smooth_weak_lambda${lambda//./p}"; model_path="${scene_output_root}/${exp_name}";
-run_single_experiment "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path" \
-    --use_smoothness_loss --lambda_smooth "$lambda" --smooth_start_iter "$GEOMETRY_START_ITER"
+# --- 实验 02: [消融A] 测试 DINO 诊断模块 ---
+exp_name="exp02_ablation_dino"; model_path="${scene_output_root}/${exp_name}";
+run_single_experiment "$MY_PROJECT_DIR" "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path" \
+    --structural_loss_mode "dino_feat" `# <-- 核心改动` \
+    --synergy_mode "v5_error_dynamics" \
+    --lambda_struct_loss 0.0 \
+    --lambda_struct_loss_base 0.1 \
+    --lambda_grad_loss_base 0.05 \
+    --error_dynamics_threshold 0.005 `# 注意: DINO的阈值可能需要根据实际误差值进行调整`
 
-# exp03: 平滑度损失 (中)
-lambda=0.01; exp_name="exp03_smooth_medium_lambda${lambda//./p}"; model_path="${scene_output_root}/${exp_name}";
-run_single_experiment "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path" \
-    --use_smoothness_loss --lambda_smooth "$lambda" --smooth_start_iter "$GEOMETRY_START_ITER"
 
-# exp04: 平滑度损失 (强)
-lambda=0.05; exp_name="exp04_smooth_strong_lambda${lambda//./p}"; model_path="${scene_output_root}/${exp_name}";
-run_single_experiment "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path" \
-    --use_smoothness_loss --lambda_smooth "$lambda" --smooth_start_iter "$GEOMETRY_START_ITER"
+# --- 实验 03: [消融B] 测试 SVAS 策略模块 ---
+exp_name="exp03_ablation_svas"; model_path="${scene_output_root}/${exp_name}";
+run_single_experiment "$MY_PROJECT_DIR" "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path" \
+    --structural_loss_mode "ms_grad" \
+    --synergy_mode_spatial `# <-- 核心改动` \
+    `# SVAS 也需要这些 base lambda 来定义宏观/微观损失` \
+    --lambda_struct_loss_base 0.1 \
+    --lambda_grad_loss_base 0.05 \
+    --error_dynamics_threshold 0.015
 
-# --- 实验 05: 单独测试策略 #3 (几何感知的致密化) ---
-# 同样在 6000 次迭代后引入
-exp_name="exp05_geo_densify_only"; model_path="${scene_output_root}/${exp_name}";
-run_single_experiment "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path" \
-    --use_geometric_densify --geo_densify_start_iter "$GEOMETRY_START_ITER"
 
-# --- 实验 06: 组合测试 (策略 #2 + #3) ---
-# 将两个策略结合，使用一个中等强度的平滑度损失
-lambda=0.01; exp_name="exp06_combined_smooth_medium_geo_densify"; model_path="${scene_output_root}/${exp_name}";
-run_single_experiment "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path" \
-    --use_smoothness_loss --lambda_smooth "$lambda" --smooth_start_iter "$GEOMETRY_START_ITER" \
-    --use_geometric_densify --geo_densify_start_iter "$GEOMETRY_START_ITER"
+# --- 实验 04: [消融C] 测试 DEID 执行模块 ---
+exp_name="exp04_ablation_deid"; model_path="${scene_output_root}/${exp_name}";
+run_single_experiment "$MY_PROJECT_DIR" "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path" \
+    --structural_loss_mode "ms_grad" \
+    --synergy_mode "v5_error_dynamics" \
+    --intelligent_densification `# <-- 核心改动` \
+    --lambda_struct_loss 0.0 \
+    --lambda_struct_loss_base 0.1 \
+    --lambda_grad_loss_base 0.05 \
+    --error_dynamics_threshold 0.015
+
+
+# --- 实验 05: [消融D] 测试 OAI 引导模块 ---
+exp_name="exp05_ablation_oai"; model_path="${scene_output_root}/${exp_name}";
+run_single_experiment "$MY_PROJECT_DIR" "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path" \
+    --structural_loss_mode "ms_grad" \
+    --synergy_mode "v5_error_dynamics" \
+    --optimizer_intervention `# <-- 核心改动` \
+    --lambda_struct_loss 0.0 \
+    --lambda_struct_loss_base 0.1 \
+    --lambda_grad_loss_base 0.05 \
+    --error_dynamics_threshold 0.015
+
+
+# --- 实验 06: [关键协同] DINO + SVAS ---
+exp_name="exp06_synergy_dino_svas"; model_path="${scene_output_root}/${exp_name}";
+run_single_experiment "$MY_PROJECT_DIR" "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path" \
+    --structural_loss_mode "dino_feat" `# <-- 组合1` \
+    --synergy_mode_spatial `# <-- 组合2` \
+    --lambda_struct_loss_base 0.1 \
+    --lambda_grad_loss_base 0.05 \
+    --error_dynamics_threshold 0.005
+
+
+# --- 实验 07: [最终模型] DINO + SVAS + DEID ---
+exp_name="exp07_ours_full_model"; model_path="${scene_output_root}/${exp_name}";
+run_single_experiment "$MY_PROJECT_DIR" "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path" \
+    --structural_loss_mode "dino_feat" `# <-- 组合1` \
+    --synergy_mode_spatial `# <-- 组合2` \
+    --intelligent_densification `# <-- 组合3` \
+    --lambda_struct_loss_base 0.1 \
+    --lambda_grad_loss_base 0.05 \
+    --error_dynamics_threshold 0.005
+
+
+# --- [ 3. 新增三组协同与探索实验 ] ---
+
+# --- 实验 08: [极限性能] DINO + SVAS + DEID + OAI (所有模组) ---
+exp_name="exp08_ours_ultimate_all_modules"; model_path="${scene_output_root}/${exp_name}";
+run_single_experiment "$MY_PROJECT_DIR" "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path" \
+    --structural_loss_mode "dino_feat" `# <-- 组合1` \
+    --synergy_mode_spatial `# <-- 组合2` \
+    --intelligent_densification `# <-- 组合3` \
+    --optimizer_intervention `# <-- 组合4` \
+    --lambda_struct_loss_base 0.1 \
+    --lambda_grad_loss_base 0.05 \
+    --error_dynamics_threshold 0.005
+
+
+# --- 实验 09: [高效协同] DINO + DEID + OAI (跳过SVAS) ---
+exp_name="exp09_synergy_dino_deid_oai"; model_path="${scene_output_root}/${exp_name}";
+run_single_experiment "$MY_PROJECT_DIR" "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path" \
+    --structural_loss_mode "dino_feat" `# <-- 组合1` \
+    --synergy_mode "v5_error_dynamics" `# <-- 使用基础的动态协同` \
+    --intelligent_densification `# <-- 组合2` \
+    --optimizer_intervention `# <-- 组合3` \
+    --lambda_struct_loss 0.0 \
+    --lambda_struct_loss_base 0.1 \
+    --lambda_grad_loss_base 0.05 \
+    --error_dynamics_threshold 0.005
+
+
+# --- 实验 10: [外部对比] 物理Alpha (Physical Alpha) ---
+# 注意：这是一个完全不同的分支，它不使用动态lambda或OAI等。
+exp_name="exp10_alternative_physical_alpha"; model_path="${scene_output_root}/${exp_name}";
+run_single_experiment "$MY_PROJECT_DIR" "$SCENE" "$exp_name" "$model_path" "${base_args[@]}" -m "$model_path" \
+    --structural_loss_mode "ms_grad" \
+    --synergy_mode "v5_physical_alpha" `# <-- 核心改动` \
+    --lambda_struct_loss 0.05 `# physical_alpha 使用固定的结构损失`
 
 # ========================== [ 实验组结束 ] ==========================
-
-# --- [ 最终总结 ] ---
-echo; echo "######################################################################"
-echo "### 🎉🎉🎉 Bonsai 场景的几何增强策略实验执行完毕！ ###"
-echo "### 性能排行榜已保存在 ${ranking_file} 文件中。 ###"
-echo "######################################################################"
-# 自动排序并显示最终排名
-echo; echo "--- 最终性能排名 (PSNR @ ${ITERATIONS} iters) ---"
-(head -n 2 "$ranking_file" && tail -n +3 "$ranking_file" | sort -k3 -nr) | column -t -s '|'
-echo "------------------------------------------------"
+echo; echo "### 🎉🎉🎉 V6 核心模组对决实验 (最终扩展版) 执行完毕！ ###";
+echo "请检查目录 ${EXPERIMENTS_ROOT_DIR}/${SCENE} 以获取所有实验的结果。";
